@@ -8,10 +8,13 @@ results/
 quixer_results/
 lambeq_results/
 simple_embeddings/
+
+# Runtime outputs
 logs/
 
 # Python
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *$py.class
 *.so
@@ -41,7 +44,7 @@ ENV/
 env/
 .venv
 
-# IDE
+# IDE / editor artifacts
 .vscode/
 .idea/
 *.swp
@@ -53,7 +56,7 @@ env/
 .ipynb_checkpoints/
 *.ipynb
 
-# PyTorch
+# PyTorch artifacts
 *.pt
 *.pth
 *.pkl
