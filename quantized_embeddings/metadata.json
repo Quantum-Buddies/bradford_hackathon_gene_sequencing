@@ -1,0 +1,12 @@
+{
+  "n_clusters": 512,
+  "seq_len": 32,
+  "embedding_dim": 64,
+  "vocabulary_size": 512,
+  "n_classes": 2,
+  "source": "/scratch/cbjp404/bradford_hackathon_2025/lambeq_embeddings",
+  "quantization_method": "MiniBatchKMeans",
+  "seed": 42,
+  "per_kmer_mode": true,
+  "original_seq_len": 80
+}

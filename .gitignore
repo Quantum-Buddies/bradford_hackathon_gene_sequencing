@@ -1,10 +1,5 @@
 # Data directories (large files)
-processed_data/
-lambeq_embeddings/
-quantized_embeddings/
-quixer_hybrid_results/
 optuna_results/
-results/
 quixer_results/
 lambeq_results/
 simple_embeddings/

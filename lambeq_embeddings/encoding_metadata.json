@@ -1,0 +1,9 @@
+{
+  "embedding_dim": 64,
+  "n_layers": 2,
+  "seed": 42,
+  "ansatz": "IQP",
+  "parser": "Per-kmer (no sentence-level parsing)",
+  "max_kmers": 80,
+  "encoding_mode": "per_kmer_sequence"
+}
