@@ -407,15 +407,21 @@ def main():
     
     # Save best parameters
     best_params_file = output_dir / f'best_params_{timestamp}.json'
+    # Ensure fixed parameters from metadata are preserved in saved config
+    best_params_payload = {
+        'best_trial_number': best_trial.number,
+        'best_value': best_trial.value,
+        'best_params': {
+            **best_trial.params,
+            'embedding_dim': METADATA['embedding_dim'],
+        },
+        'study_name': study.study_name,
+        'n_trials': len(study.trials),
+        'timestamp': timestamp
+    }
+
     with open(best_params_file, 'w') as f:
-        json.dump({
-            'best_trial_number': best_trial.number,
-            'best_value': best_trial.value,
-            'best_params': best_trial.params,
-            'study_name': study.study_name,
-            'n_trials': len(study.trials),
-            'timestamp': timestamp
-        }, f, indent=2)
+        json.dump(best_params_payload, f, indent=2)
     print(f"Best parameters saved to: {best_params_file}")
     
     # Save trials dataframe
@@ -460,10 +466,11 @@ def main():
     print("\nTrain final model with best hyperparameters:")
     print(f"\nCUDA_VISIBLE_DEVICES=0 python train_quixer_hybrid.py \\")
     print(f"  --data_dir {args.data_dir} \\")
+    best_embedding_dim = METADATA['embedding_dim']
     print(f"  --qubits {best_trial.params['qubits']} \\")
     print(f"  --layers {best_trial.params['layers']} \\")
     print(f"  --ansatz_layers {best_trial.params['ansatz_layers']} \\")
-    print(f"  --embedding_dim {best_trial.params['embedding_dim']} \\")
+    print(f"  --embedding_dim {best_embedding_dim} \\")
     print(f"  --dropout {best_trial.params['dropout']:.4f} \\")
     print(f"  --batch_size {best_trial.params['batch_size']} \\")
     print(f"  --lr {best_trial.params['lr']:.6f} \\")
