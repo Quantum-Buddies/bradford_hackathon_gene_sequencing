@@ -451,7 +451,9 @@ class SimpleKmerEncoder:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Encode genomics dataset with lambeq")
-    parser.add_argument("--embedding_dim", type=int, default=512, help="Embedding dimension")
+    parser.add_argument("--data_dir", type=str, default="processed_data", help="Input data directory")
+    parser.add_argument("--output_dir", type=str, default="lambeq_embeddings", help="Output directory")
+    parser.add_argument("--embedding_dim", type=int, default=64, help="Embedding dimension")
     parser.add_argument("--layers", type=int, default=2, help="Number of IQP ansatz layers")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--workers", type=int, default=1, help="Parallel worker processes")
@@ -461,6 +463,8 @@ if __name__ == "__main__":
     # Try lambeq encoder first, fall back to simple encoder
     try:
         encoder = GenomicLambeqEncoder(
+            data_dir=args.data_dir,
+            output_dir=args.output_dir,
             embedding_dim=args.embedding_dim,
             n_layers=args.layers,
             seed=args.seed,

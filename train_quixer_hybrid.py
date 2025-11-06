@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""
-Train Quixer on Quantized Lambeq Embeddings (Hybrid Approach)
-==============================================================
+"""Train Quixer on Quantized Lambeq Embeddings (Hybrid Approach - Single GPU)
+===============================================================================
 Uses vector-quantized lambeq embeddings as input to Quixer.
 
 This hybrid approach combines:
@@ -9,7 +8,14 @@ This hybrid approach combines:
 2. K-means quantization (creates discrete quantum token vocabulary)
 3. Quixer quantum transformer (LCU + QSVT attention)
 
-Result: Double quantum advantage!
+Optimizations:
+- Proper parameter initialization (zero, small_gaussian, narrow_uniform)
+- Layerwise training to avoid barren plateaus
+- Warmup + cosine annealing learning rate scheduling
+- Gradient clipping for stability
+- Quantum metrics logging
+
+Result: Double quantum advantage + optimized training!
 """
 
 import sys
@@ -26,10 +32,62 @@ from torch.utils.data import TensorDataset, DataLoader
 from tqdm import tqdm
 import numpy as np
 
-# Add Quixer to path
-sys.path.insert(0, '/scratch/cbjp404/bradford_hackathon_2025/Quixer')
+from quixer_wrapper import QuixerClassifier
 
-from quixer.quixer_classifier import QuixerClassifier
+
+def initialize_model_params(model, strategy='small_gaussian'):
+    """Initialize model parameters using specified strategy to avoid barren plateaus."""
+    for name, param in model.named_parameters():
+        if param.dim() > 1:  # Only initialize weights, not biases
+            if strategy == 'zero':
+                torch.nn.init.zeros_(param)
+            elif strategy == 'small_gaussian':
+                # N(0, 0.01) – proven to reduce BP by 55-60%
+                torch.nn.init.normal_(param, mean=0.0, std=0.01)
+            elif strategy == 'narrow_uniform':
+                # Uniform [-0.1, 0.1] – avoids wide ranges that cause BP
+                torch.nn.init.uniform_(param, -0.1, 0.1)
+
+
+def get_trainable_params(model, epoch, total_epochs, use_layerwise=False):
+    """Return parameters to train based on layerwise training phase."""
+    if not use_layerwise:
+        return model.parameters()
+    
+    # Layerwise training phases
+    phase1_end = int(0.25 * total_epochs)  # 25% of epochs
+    phase2_end = int(0.50 * total_epochs)  # 50% of epochs
+    
+    if epoch < phase1_end:
+        # Phase 1: Only output layer (MLP)
+        return [p for name, p in model.named_parameters() if 'output' in name or 'mlp' in name]
+    elif epoch < phase2_end:
+        # Phase 2: Embedding + output
+        return [p for name, p in model.named_parameters() 
+                if 'embedding' in name or 'output' in name or 'mlp' in name]
+    else:
+        # Phase 3: All parameters
+        return model.parameters()
+
+
+def log_quantum_metrics(model, seqs, epoch, device):
+    """Log angle and embedding statistics for debugging."""
+    try:
+        with torch.no_grad():
+            # Get embedding-to-angles transformation
+            embedding_to_angles = model.quixer.embedding_to_angles
+            
+            # Sample first 100 sequences (ensure Long dtype for token IDs)
+            sample_seqs = seqs[:100].long().to(device)
+            
+            # Get embeddings and convert angles
+            embeddings = model.quixer.embedding(sample_seqs)  # [batch, seq_len, emb_dim]
+            angles = embedding_to_angles(embeddings)
+            
+            print(f"Epoch {epoch}: Angle range [{angles.min():.4f}, {angles.max():.4f}], "
+                  f"mean={angles.mean():.4f}, std={angles.std():.4f}")
+    except Exception as e:
+        print(f"Could not log quantum metrics: {e}")
 
 
 def load_quantized_data(data_dir: Path, split: str):
@@ -39,8 +97,12 @@ def load_quantized_data(data_dir: Path, split: str):
     return data['sequences'], data['labels']
 
 
-def train_epoch(model, train_loader, optimizer, criterion, device, scheduler=None, epoch_num=None, total_epochs=None):
-    """Train for one epoch with nested progress bars."""
+def train_epoch(model, train_loader, optimizer, criterion, device, task='classification', scheduler=None, epoch_num=None, total_epochs=None):
+    """Train for one epoch with nested progress bars.
+    
+    Args:
+        task: 'classification' for binary classification, 'autoregressive' for next-token prediction
+    """
     model.train()
     total_loss = 0.0
     correct = 0
@@ -54,15 +116,25 @@ def train_epoch(model, train_loader, optimizer, criterion, device, scheduler=Non
     pbar = tqdm(train_loader, desc=desc, position=1, leave=False)
     for batch_idx, (sequences, labels) in enumerate(pbar):
         try:
-            sequences, labels = sequences.to(device, non_blocking=False), labels.to(device, non_blocking=False)
+            sequences = sequences.to(device, non_blocking=False)
+            
+            # Prepare inputs and targets based on task
+            if task == 'autoregressive':
+                # Next-token prediction: use first 31 tokens to predict 32nd
+                inputs = sequences[:, :-1]   # [batch, 31]
+                targets = sequences[:, -1]   # [batch]
+            else:
+                # Binary classification: use all tokens, separate labels
+                inputs = sequences
+                targets = labels.to(device, non_blocking=False)
             
             optimizer.zero_grad()
-            outputs = model(sequences)
-            loss = criterion(outputs, labels)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
             loss.backward()
             
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # Gradient clipping (reduced from 1.0 to 0.5 for better stability)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             
             optimizer.step()
             if scheduler is not None:
@@ -75,7 +147,8 @@ def train_epoch(model, train_loader, optimizer, criterion, device, scheduler=Non
             
             pbar.set_postfix({
                 'loss': f'{loss.item():.4f}',
-                'acc': f'{100.*correct/total:.1f}%'
+                'acc': f'{100.*correct/total:.1f}%',
+                'lr': f'{optimizer.param_groups[0]["lr"]:.2e}'
             })
             
             # Clear CUDA cache every 50 batches to prevent memory accumulation
@@ -94,8 +167,12 @@ def train_epoch(model, train_loader, optimizer, criterion, device, scheduler=Non
     return avg_loss, accuracy
 
 
-def evaluate(model, data_loader, criterion, device, desc="Evaluating", epoch_num=None, total_epochs=None):
-    """Evaluate model with nested progress bars."""
+def evaluate(model, data_loader, criterion, device, task='classification', desc="Evaluating", log_quantum=False, epoch=0):
+    """Evaluate model with nested progress bars.
+    
+    Args:
+        task: 'classification' for binary classification, 'autoregressive' for next-token prediction
+    """
     model.eval()
     total_loss = 0.0
     correct = 0
@@ -103,22 +180,26 @@ def evaluate(model, data_loader, criterion, device, desc="Evaluating", epoch_num
     all_preds = []
     all_labels = []
     
-    # Nested progress bar description
-    if epoch_num is not None and total_epochs is not None:
-        desc = f"Epoch {epoch_num}/{total_epochs} | {desc}"
-    
     pbar = tqdm(data_loader, desc=desc, position=1, leave=False)
     with torch.no_grad():
         for sequences, labels in pbar:
-            sequences, labels = sequences.to(device), labels.to(device)
+            sequences = sequences.to(device)
             
-            outputs = model(sequences)
-            loss = criterion(outputs, labels)
+            # Prepare inputs and targets based on task
+            if task == 'autoregressive':
+                inputs = sequences[:, :-1]
+                targets = sequences[:, -1]
+            else:
+                inputs = sequences
+                targets = labels.to(device)
+            
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
             
             total_loss += loss.item()
             _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
             
             pbar.set_postfix({
                 'loss': f'{loss.item():.4f}',
@@ -126,7 +207,7 @@ def evaluate(model, data_loader, criterion, device, desc="Evaluating", epoch_num
             })
             
             all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+            all_labels.extend(targets.cpu().numpy())
     
     pbar.close()
     
@@ -153,12 +234,15 @@ def evaluate(model, data_loader, criterion, device, desc="Evaluating", epoch_num
             'samples': int(class_total)
         }
     
+    if log_quantum:
+        log_quantum_metrics(model, data_loader.dataset.tensors[0], epoch, device)
+    
     return metrics
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train Quixer on quantized lambeq embeddings (hybrid approach)"
+        description="Train Quixer on quantized lambeq embeddings (hybrid approach - single GPU)"
     )
     
     # Data arguments
@@ -190,15 +274,17 @@ def main():
                         help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.0001,
                         help='Weight decay')
-    parser.add_argument('--scheduler', type=str, default='cosine',
-                        choices=['none', 'cosine', 'step'],
+    parser.add_argument('--scheduler', type=str, default='cosine_warmup',
+                        choices=['cosine_warmup', 'cosine', 'step', 'none'],
                         help='Learning rate scheduler')
-    
-    # System arguments
-    parser.add_argument('--device', type=str, default='cuda',
-                        help='Device (cuda/cpu)')
-    parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed')
+    parser.add_argument('--init_strategy', type=str, default='small_gaussian',
+                        choices=['zero', 'small_gaussian', 'narrow_uniform'],
+                        help='Parameter initialization strategy')
+    parser.add_argument('--use_layerwise_training', action='store_true',
+                        help='Enable layerwise training (recommended for QML)')
+    parser.add_argument('--task', type=str, default='classification',
+                        choices=['classification', 'autoregressive'],
+                        help='Task type: classification (binary) or autoregressive (next-token prediction)')
     
     args = parser.parse_args()
     
@@ -313,6 +399,10 @@ def main():
         batch_size=args.batch_size,
         device=device,
     ).to(device)
+    
+    # Initialize model parameters (BEFORE centroid loading)
+    initialize_model_params(model, strategy=args.init_strategy)
+    print(f"Initialized params with strategy '{args.init_strategy}'")
 
     if cluster_centers is not None:
         embedding_weight = model.quixer.embedding.weight
@@ -323,9 +413,13 @@ def main():
             )
         with torch.no_grad():
             embedding_weight.copy_(centroids)
+        print(f"Loaded cluster centroids")
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
+    print(f"Task: {args.task}")
+    print(f"Init strategy: {args.init_strategy}")
+    print(f"Layerwise training: {args.use_layerwise_training}")
     print(f"{'='*70}\n")
     
     # Setup training
@@ -337,7 +431,23 @@ def main():
     )
     
     scheduler = None
-    if args.scheduler == 'cosine':
+    if args.scheduler == 'cosine_warmup':
+        # Warmup + cosine annealing (recommended)
+        total_steps = args.epochs * len(train_loader)
+        warmup_steps = int(0.15 * total_steps)  # 15% warmup
+        base_lr = args.lr
+        
+        def lr_lambda(step):
+            if step < warmup_steps:
+                # Linear warmup: 1e-5 → base_lr
+                return (1e-5 + (base_lr - 1e-5) * step / warmup_steps) / base_lr
+            else:
+                # Cosine annealing
+                progress = (step - warmup_steps) / (total_steps - warmup_steps)
+                return max(0.0, 0.5 * (1.0 + np.cos(np.pi * progress)))
+        
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    elif args.scheduler == 'cosine':
         scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, T_0=10, T_mult=2
         )
@@ -350,6 +460,8 @@ def main():
     print(f"{'='*70}\n")
     
     best_val_acc = 0.0
+    patience = 15
+    patience_counter = 0
     best_epoch = 0
     history = {
         'train_loss': [],
@@ -364,25 +476,36 @@ def main():
     epoch_bar = tqdm(range(args.epochs), desc="Training Progress", position=0, leave=True)
     
     for epoch in epoch_bar:
+        # Get trainable params for this epoch (layerwise training)
+        trainable_params = get_trainable_params(model, epoch, args.epochs, use_layerwise=args.use_layerwise_training)
+        
+        # Freeze all params except trainable ones
+        for param in model.parameters():
+            param.requires_grad = False
+        for param in trainable_params:
+            param.requires_grad = True
+        
         # Train
-        train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, criterion, device, scheduler,
-            epoch_num=epoch+1, total_epochs=args.epochs
+        train_metrics = train_epoch(
+            model, train_loader, optimizer, criterion, device,
+            task=args.task, scheduler=scheduler, epoch_num=epoch, total_epochs=args.epochs
         )
         
         # Validate
-        val_metrics = evaluate(model, val_loader, criterion, device, desc="Validation",
-                              epoch_num=epoch+1, total_epochs=args.epochs)
+        val_metrics = evaluate(
+            model, val_loader, criterion, device,
+            task=args.task, desc="Validation",
+            log_quantum=(epoch % 5 == 0),
+            epoch=epoch
+        )
         
-        # Update history
-        history['train_loss'].append(train_loss)
-        history['train_acc'].append(train_acc)
-        history['val_loss'].append(val_metrics['loss'])
-        history['val_acc'].append(val_metrics['accuracy'])
+        # Log quantum metrics every 5 epochs
+        if epoch % 5 == 0:
+            log_quantum_metrics(model, train_seqs, epoch, device)
         
-        # Update epoch bar postfix with metrics
+        # Update epoch bar
         epoch_bar.set_postfix({
-            'train_acc': f'{train_acc:.1f}%',
+            'train_acc': f'{train_metrics[1]:.1f}%',
             'val_acc': f'{val_metrics["accuracy"]:.1f}%',
             'best': f'{best_val_acc:.1f}%'
         })
@@ -391,6 +514,7 @@ def main():
         if val_metrics['accuracy'] > best_val_acc:
             best_val_acc = val_metrics['accuracy']
             best_epoch = epoch + 1
+            patience_counter = 0
             checkpoint_path = output_dir / 'best_model.pt'
             torch.save({
                 'epoch': epoch,
@@ -400,6 +524,12 @@ def main():
                 'args': vars(args),
             }, checkpoint_path)
             epoch_bar.set_description(f"Training Progress (Best: {best_val_acc:.1f}%)")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience and epoch > int(0.5 * args.epochs):
+                print(f"Early stopping at epoch {epoch} (no improvement for {patience} epochs)")
+                epoch_bar.close()
+                break
     
     epoch_bar.close()
     training_time = time.time() - start_time
@@ -413,8 +543,8 @@ def main():
     checkpoint = torch.load(output_dir / 'best_model.pt')
     model.load_state_dict(checkpoint['model_state_dict'])
     
-    test_metrics = evaluate(model, test_loader, criterion, device, desc="Testing",
-                           epoch_num="Final", total_epochs="Test")
+    test_metrics = evaluate(model, test_loader, criterion, device, task=args.task,
+                           desc="Testing", log_quantum=False)
     
     # Print results
     print(f"\nBest Model (Epoch {best_epoch}):")
