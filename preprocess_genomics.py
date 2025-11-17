@@ -8,7 +8,7 @@ Based on research insights from:
 - k-mer based genomics ML (iMOKA, Genome Biology 2020)
 - DNABERT-2 tokenization strategies (arXiv 2023)
 
-Task: Binary classification of genomic regions (promoter vs. non-promoter)
+Task: Binary classification of transcript type (coding mRNA vs. non-coding RNA)
 """
 
 import pandas as pd
@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import List, Tuple, Dict
 import json
 from collections import Counter
-import re
+from sklearn.model_selection import train_test_split
+from itertools import product
 
 class GenomicDataPreprocessor:
     """
@@ -35,7 +36,7 @@ class GenomicDataPreprocessor:
         self,
         data_dir: str = "/scratch/cbjp404/bradford_hackathon_2025/GRCh38_genomic_dataset",
         output_dir: str = "/scratch/cbjp404/bradford_hackathon_2025/processed_data",
-        k: int = 6,
+        k: int = 4,
         window_size: int = 512,
         stride: int = 256,
         seed: int = 42
@@ -48,6 +49,9 @@ class GenomicDataPreprocessor:
         self.window_size = window_size  # sequence window length
         self.stride = stride  # sliding window stride
         self.seed = seed
+        self._kmer_classes: List[str] = []
+        self.label_lookup: Dict[str, int] = {}
+        self.chunked_windows: List[List[str]] = []
         
         np.random.seed(seed)
         
@@ -62,6 +66,14 @@ class GenomicDataPreprocessor:
         """Load RNA summary data (contains transcript information)."""
         rna_file = self.data_dir / "GRCh38_latest_rna_summary.csv"
         print(f"\nLoading RNA data from {rna_file}...")
+
+        if not rna_file.exists():
+            print("  WARNING: RNA summary file not found. Falling back to synthetic descriptions.")
+            synthetic_desc = (
+                ["synthetic coding mRNA transcript"] * 50
+                + ["synthetic noncoding lncRNA transcript"] * 50
+            )
+            return pd.DataFrame({'Description': synthetic_desc})
         
         # Read with low_memory=False to handle mixed types
         df = pd.read_csv(rna_file, low_memory=False)
@@ -103,57 +115,148 @@ class GenomicDataPreprocessor:
         kmers = self.extract_kmers(sequence)
         return ' '.join(kmers)
     
+    def chunk_sequence(self, sequence: str, chunk_size: int = None) -> List[str]:
+        """
+        Break a sequence into non-overlapping chunks of length `chunk_size`.
+        """
+        if chunk_size is None:
+            chunk_size = self.k
+        if chunk_size <= 0:
+            return []
+        
+        sequence = sequence.upper().replace('U', 'T')
+        chunks = []
+        for i in range(0, len(sequence) - chunk_size + 1, chunk_size):
+            chunk = sequence[i:i+chunk_size]
+            if len(chunk) == chunk_size and all(n in 'ACGT' for n in chunk):
+                chunks.append(chunk)
+        return chunks
+    
+    def _get_all_kmer_classes(self) -> List[str]:
+        """Return cached list of all possible k-mer combinations."""
+        if not self._kmer_classes:
+            self._kmer_classes = [''.join(p) for p in product('ACGT', repeat=self.k)]
+        return self._kmer_classes
+    
     def create_synthetic_labels(
         self,
         df: pd.DataFrame,
         n_samples: int = 10000
     ) -> Tuple[List[str], List[int]]:
         """
-        Create synthetic promoter/non-promoter labels.
-        
+        Create labeled non-overlapping k-mer sequences that cover every
+        possible nucleotide combination of length `self.k`.
+
         Strategy:
-        - Promoter (label=1): regions with high gene density indicators
-        - Non-promoter (label=0): intergenic or low-annotation regions
-        
-        Args:
-            df: RNA dataframe
-            n_samples: number of windows to generate
-        
-        Returns:
-            (sequences, labels) where labels are 0/1
+        - infer coding vs non-coding descriptions to seed realistic motifs
+        - synthesize random windows with light motif injection
+        - break each window into non-overlapping k-mer "chains"
+        - label every k-mer using the complete combination list (ACGT)^k
+        - inject any missing k-mers so every label is represented at least once
         """
-        print(f"\nGenerating {n_samples} synthetic labeled windows...")
-        
-        sequences = []
-        labels = []
-        
-        # Simple heuristic: look for annotation keywords
-        promoter_keywords = ['promoter', 'transcript', 'mrna', 'gene']
-        
-        for idx, row in df.head(min(len(df), n_samples * 10)).iterrows():
-            # Extract description or sequence-related info
-            description = str(row.get('Description', '')).lower()
-            
-            # Generate synthetic sequence (placeholder - in real use, fetch from FASTA)
-            # For demonstration, create random sequences
-            seq_len = self.window_size
-            seq = ''.join(np.random.choice(['A', 'C', 'G', 'T'], size=seq_len))
-            
-            # Label based on description
-            is_promoter = any(kw in description for kw in promoter_keywords)
-            label = 1 if is_promoter else 0
-            
-            sequences.append(seq)
-            labels.append(label)
-            
-            if len(sequences) >= n_samples:
-                break
-        
-        print(f"Generated {len(sequences)} sequences")
-        print(f"  Promoters (label=1): {sum(labels)}")
-        print(f"  Non-promoters (label=0): {len(labels) - sum(labels)}")
-        
-        return sequences, labels
+        print(f"\nGenerating {n_samples} labeled windows (coding vs non-coding, balanced)...")
+
+        # Normalize description column
+        desc = df.get('Description') if 'Description' in df.columns else None
+        if desc is None:
+            desc = pd.Series([''] * len(df))
+        desc = desc.fillna('').astype(str)
+
+        def classify(s: str) -> int:
+            s_low = s.lower()
+            nc_terms = [
+                'lncrna', 'ncrna', 'mirna', 'snrna', 'snorna', 'trna', 'rrna',
+                'pirna', 'scarna', 'y rna', 'y_rna', 'antisense', 'pseudogene',
+                'ribozyme', 'vault', 'misc rna', 'misc_rna'
+            ]
+            if any(t in s_low for t in nc_terms):
+                return 0
+            if 'mrna' in s_low:
+                return 1
+            return 0
+
+        labels_by_row = desc.apply(classify).values
+        df_pos = df[labels_by_row == 1]   # coding
+        df_neg = df[labels_by_row == 0]   # non-coding
+
+        n_pos = n_samples // 2
+        n_neg = n_samples - n_pos
+
+        if len(df_pos) == 0 or len(df_neg) == 0:
+            raise RuntimeError("Insufficient rows to build both classes from RNA summary.")
+
+        # Motif-based synthetic sequences to create learnable but non-trivial signal
+        rng = np.random.default_rng(self.seed)
+        coding_codons = ["ATG", "GCT", "GCC", "GCA", "GCG", "GAA", "GAG", "GGT", "GGC", "GGA", "GGG"]
+        stop_codons = ["TAA", "TAG", "TGA"]
+        noncoding_motifs = ["AAAAAA", "TTTTTT", "CCCCCC", "GGGGGG"]
+
+        def insert_motif(seq: str, motif: str) -> str:
+            i = int(rng.integers(0, max(1, len(seq) - len(motif) + 1)))
+            return seq[:i] + motif + seq[i+len(motif):]
+
+        def gen_seq_with_label(label: int) -> str:
+            seq = ''.join(rng.choice(list('ACGT'), size=self.window_size))
+            if label == 1:
+                seq = insert_motif(seq, 'ATG')
+                seq = insert_motif(seq, rng.choice(stop_codons))
+                for _ in range(3):
+                    seq = insert_motif(seq, rng.choice(coding_codons))
+            else:
+                for _ in range(2):
+                    seq = insert_motif(seq, rng.choice(noncoding_motifs))
+                seq = seq.replace('ATG', 'ATA')
+            return seq
+
+        pos_rows = df_pos.sample(n=n_pos, replace=True, random_state=self.seed)
+        neg_rows = df_neg.sample(n=n_neg, replace=True, random_state=self.seed)
+
+        raw_sequences: List[str] = []
+        for _ in range(len(pos_rows)):
+            raw_sequences.append(gen_seq_with_label(1))
+        for _ in range(len(neg_rows)):
+            raw_sequences.append(gen_seq_with_label(0))
+
+        indices = np.random.permutation(len(raw_sequences))
+        raw_sequences = [raw_sequences[i] for i in indices]
+
+        print(
+            f"Generated {len(raw_sequences)} sequences "
+            f"(coding={len(pos_rows)}, non-coding={len(neg_rows)})"
+        )
+
+        print(f"Breaking down sequences into non-overlapping {self.k}-mers and assigning labels...")
+        kmer_classes = self._get_all_kmer_classes()
+        self.label_lookup = {kmer: idx for idx, kmer in enumerate(kmer_classes)}
+        chunk_sequences: List[str] = []
+        chunk_labels: List[int] = []
+        seen_counts = Counter()
+        chunked_windows: List[List[str]] = []
+
+        for seq in raw_sequences:
+            chunks = self.chunk_sequence(seq, chunk_size=self.k)
+            if not chunks:
+                continue
+            chunked_windows.append(chunks)
+            for chunk in chunks:
+                chunk_sequences.append(chunk)
+                label = self.label_lookup[chunk]
+                chunk_labels.append(label)
+                seen_counts[chunk] += 1
+
+        missing = [kmer for kmer in self.label_lookup if kmer not in seen_counts]
+        if missing:
+            print(f"  Injecting {len(missing)} missing k-mers to cover all label combinations.")
+            for kmer in missing:
+                chunk_sequences.append(kmer)
+                chunk_labels.append(self.label_lookup[kmer])
+                seen_counts[kmer] += 1
+
+        print(f"Total chunked sequences: {len(chunk_sequences)}")
+        print(f"Unique {self.k}-mer classes observed: {len(seen_counts)} / {len(self.label_lookup)}")
+
+        self.chunked_windows = chunked_windows
+        return chunk_sequences, [int(lbl) for lbl in chunk_labels]
     
     def build_vocab(self, sequences: List[str]) -> Dict[str, int]:
         """Build k-mer vocabulary from sequences."""
@@ -180,27 +283,33 @@ class GenomicDataPreprocessor:
         train_ratio: float = 0.7,
         val_ratio: float = 0.15
     ) -> Dict[str, Tuple[List[str], List[int]]]:
-        """Split data into train/val/test sets."""
-        n = len(sequences)
-        indices = np.random.permutation(n)
-        
-        train_end = int(n * train_ratio)
-        val_end = int(n * (train_ratio + val_ratio))
-        
-        train_idx = indices[:train_end]
-        val_idx = indices[train_end:val_end]
-        test_idx = indices[val_end:]
-        
+        """Stratified split into train/val/test sets."""
+        sequences = np.array(sequences)
+        labels = np.array(labels)
+
+        test_ratio = 1.0 - train_ratio - val_ratio
+        if test_ratio <= 0:
+            raise ValueError("Invalid split ratios; ensure train_ratio + val_ratio < 1.0")
+
+        X_train, X_temp, y_train, y_temp = train_test_split(
+            sequences, labels, test_size=test_ratio + val_ratio, stratify=labels, random_state=self.seed
+        )
+        # Split temp into val and test
+        rel_test = test_ratio / (test_ratio + val_ratio)
+        X_val, X_test, y_val, y_test = train_test_split(
+            X_temp, y_temp, test_size=rel_test, stratify=y_temp, random_state=self.seed
+        )
+
         splits = {
-            'train': ([sequences[i] for i in train_idx], [labels[i] for i in train_idx]),
-            'val': ([sequences[i] for i in val_idx], [labels[i] for i in val_idx]),
-            'test': ([sequences[i] for i in test_idx], [labels[i] for i in test_idx])
+            'train': (X_train.tolist(), y_train.tolist()),
+            'val': (X_val.tolist(), y_val.tolist()),
+            'test': (X_test.tolist(), y_test.tolist()),
         }
-        
-        print(f"\nData splits:")
-        for split_name, (seqs, lbls) in splits.items():
-            print(f"  {split_name}: {len(seqs)} samples (pos={sum(lbls)}, neg={len(lbls)-sum(lbls)})")
-        
+
+        print(f"\nData splits (stratified):")
+        for name, (seqs, lbls) in splits.items():
+            unique_labels = len(set(lbls))
+            print(f"  {name}: {len(seqs)} samples across {unique_labels} classes")
         return splits
     
     def save_processed_data(
@@ -216,6 +325,13 @@ class GenomicDataPreprocessor:
         with open(vocab_file, 'w') as f:
             json.dump(vocab, f, indent=2)
         print(f"  Saved vocabulary: {vocab_file}")
+
+        label_map_file = None
+        if self.label_lookup:
+            label_map_file = self.output_dir / "label_mapping.json"
+            with open(label_map_file, 'w') as f:
+                json.dump(self.label_lookup, f, indent=2)
+            print(f"  Saved label mapping: {label_map_file}")
         
         # Save each split
         for split_name, (sequences, labels) in splits.items():
@@ -236,16 +352,37 @@ class GenomicDataPreprocessor:
                     f.write(str(label) + '\n')
             
             print(f"  Saved {split_name}: {len(sequences)} samples")
+
+        chains_file = None
+        if self.chunked_windows:
+            chains_file = self.output_dir / "chain_sequences.txt"
+            with open(chains_file, 'w') as f:
+                for window in self.chunked_windows:
+                    if not window:
+                        continue
+                    f.write(' '.join(window) + '\n')
+            print(f"  Saved chunk chain corpus: {chains_file}")
         
         # Save metadata
+        if self.label_lookup:
+            class_names = list(self.label_lookup.keys())
+            n_classes = len(class_names)
+        else:
+            aggregated_labels = set()
+            for _, (_, lbls) in splits.items():
+                aggregated_labels.update(lbls)
+            n_classes = len(aggregated_labels)
+            class_names = [str(lbl) for lbl in sorted(aggregated_labels)]
+
         metadata = {
             'k': self.k,
             'window_size': self.window_size,
             'stride': self.stride,
             'seed': self.seed,
             'vocab_size': len(vocab),
-            'n_classes': 2,
-            'class_names': ['non-promoter', 'promoter']
+            'n_classes': n_classes,
+            'class_names': class_names,
+            'label_map_file': str(label_map_file) if label_map_file else None
         }
         
         metadata_file = self.output_dir / "metadata.json"
@@ -253,8 +390,8 @@ class GenomicDataPreprocessor:
             json.dump(metadata, f, indent=2)
         print(f"  Saved metadata: {metadata_file}")
         
-        print("\n✅ Preprocessing complete!")
-    
+        print("\n[OK] Preprocessing complete!")
+
     def run(self, n_samples: int = 10000):
         """Run complete preprocessing pipeline."""
         print("=" * 70)
@@ -280,7 +417,8 @@ class GenomicDataPreprocessor:
 if __name__ == "__main__":
     # Initialize and run preprocessor
     preprocessor = GenomicDataPreprocessor(
-        k=6,  # 6-mer tokenization (balances vocabulary size vs. context)
+        k=4,  # 4-mer tokenization (enumerates every nucleotide combination)
+        output_dir=str(Path(__file__).parent / "processed_data"),
         window_size=512,  # 512 bp windows (manageable for quantum circuits)
         stride=256,  # 50% overlap
         seed=42
