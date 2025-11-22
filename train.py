@@ -7,10 +7,10 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from genomic_quixer.data.dataset import GenomicPredictionDataset
-from genomic_quixer.models.quixer import Quixer
-from genomic_quixer.models.classical import ClassicalTransformer
-from genomic_quixer.training.trainer import train_epoch, evaluate, plot_metrics
+# Simplified imports due to package __init__s
+from genomic_quixer.data import GenomicPredictionDataset
+from genomic_quixer.models import Quixer, ClassicalTransformer
+from genomic_quixer.training import train_epoch, evaluate, plot_metrics
 
 def main():
     parser = argparse.ArgumentParser(description="Train Genomic Quixer or Classical Baseline")
@@ -51,7 +51,12 @@ def main():
     
     # Load metadata
     data_dir = Path(args.data_dir)
-    with open(data_dir / 'metadata.json', 'r') as f:
+    metadata_path = data_dir / 'metadata.json'
+    
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Metadata not found at {metadata_path}. Please run preprocess.py first.")
+        
+    with open(metadata_path, 'r') as f:
         metadata = json.load(f)
     vocab_size = metadata['vocab_size']
     
@@ -61,14 +66,12 @@ def main():
     
     # Create Datasets
     print("\n=== Loading Datasets ===")
-    # Use partial or a factory if config gets complex, but direct init is fine
     train_dataset = GenomicPredictionDataset(data_dir=data_dir, window_size=args.window_size, stride=args.stride, split='train', seed=args.seed)
     val_dataset = GenomicPredictionDataset(data_dir=data_dir, window_size=args.window_size, stride=args.stride, split='val', seed=args.seed)
-    test_dataset = GenomicPredictionDataset(data_dir=data_dir, window_size=args.window_size, stride=args.stride, split='test', seed=args.seed)
     
+    # Use smaller batch size for validation/inference to avoid OOM if needed, but here double is standard for inference
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=8, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size*2, shuffle=False, num_workers=8, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size*2, shuffle=False, num_workers=8, pin_memory=True)
     
     # Initialize Model
     print(f"\n=== Initializing {args.model_type.upper()} Model ===")
@@ -91,7 +94,7 @@ def main():
             nhead=args.nhead,
             num_layers=args.num_layers,
             dim_feedforward=args.embedding_dim * 4,
-            max_len=args.window_size + 1 # +1 just in case
+            max_len=args.window_size + 1 
         )
     
     model = model.to(device)
@@ -112,36 +115,40 @@ def main():
     
     print(f"\nStarting training for {args.epochs} epochs...")
     
-    for epoch in range(args.epochs):
-        start_time = time.time()
-        
-        train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, 1.0, device, vocab_size)
-        val_loss, val_acc, val_ppl = evaluate(model, val_loader, criterion, device)
-        
-        elapsed = time.time() - start_time
-        
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        train_accs.append(train_acc)
-        val_accs.append(val_acc)
-        val_ppls.append(val_ppl)
-        
-        print(f"Epoch {epoch+1}/{args.epochs} | Time: {elapsed:.1f}s")
-        print(f"  Train Loss: {train_loss:.4f} | Acc: {train_acc:.2%}")
-        print(f"  Val   Loss: {val_loss:.4f} | Acc: {val_acc:.2%} | PPL: {val_ppl:.2f}")
-        
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'config': vars(args),
-                'val_loss': val_loss,
-            }, checkpoint_path)
-            print(f"  -> Saved best model to {checkpoint_path}")
-        print()
-        
+    try:
+        for epoch in range(args.epochs):
+            start_time = time.time()
+            
+            train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, 1.0, device, vocab_size)
+            val_loss, val_acc, val_ppl = evaluate(model, val_loader, criterion, device)
+            
+            elapsed = time.time() - start_time
+            
+            train_losses.append(train_loss)
+            val_losses.append(val_loss)
+            train_accs.append(train_acc)
+            val_accs.append(val_acc)
+            val_ppls.append(val_ppl)
+            
+            print(f"Epoch {epoch+1}/{args.epochs} | Time: {elapsed:.1f}s")
+            print(f"  Train Loss: {train_loss:.4f} | Acc: {train_acc:.2%}")
+            print(f"  Val   Loss: {val_loss:.4f} | Acc: {val_acc:.2%} | PPL: {val_ppl:.2f}")
+            
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'config': vars(args),
+                    'val_loss': val_loss,
+                }, checkpoint_path)
+                print(f"  -> Saved best model to {checkpoint_path}")
+            print()
+            
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user. Saving current progress...")
+    
     # Plotting
     plot_path = output_dir / f"{args.model_type}_training_curves_{timestamp}.png"
     plot_metrics(train_losses, val_losses, train_accs, val_accs, val_ppls, plot_path)
