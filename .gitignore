@@ -3,6 +3,10 @@ optuna_results/
 quixer_results/
 lambeq_results/
 simple_embeddings/
+genomic_data_preprocessed_kmers/
+genomic_data/
+results/
+trained_models/
 
 # Runtime outputs
 logs/
